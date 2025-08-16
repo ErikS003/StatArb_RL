@@ -237,3 +237,116 @@ def best_coefficient_emrt(
         best_B = 1.0
         best_r = float("inf")
     return best_B, best_r
+
+
+# 2) RL: Tabular Q-learning agent (Sec. 4.2)
+
+@dataclass
+class RLConfig:
+    lookback_l: int = 4
+    # OLD: k_thresh_pct -> keep for backwards compat but unused when use_zscore_state=True
+    k_thresh_pct: float = 3.0
+    # NEW: use z-score state & threshold in sigmas
+    use_zscore_state: bool = True
+    k_std: float = 0.25        # bin threshold in σ-units for Δz
+    alpha: float = 0.1
+    gamma: float = 0.99
+    epsilon: float = 0.1
+    trans_cost: float = 0.0
+    seed: Optional[int] = None
+
+class MeanReversionEnv:
+    """
+    X_t is the spread; we standardize it to z_t = (X_t - theta)/std for states.
+    Actions: -1 (sell/short or reduce), 0 (hold), +1 (buy/long or reduce).
+    Position pos ∈ {-1, 0, +1}, one unit max.
+    Reward: R_{t+1} = A_t * (theta - X_t) - c*|A_t|
+    """
+
+    def __init__(self, x: np.ndarray, theta: float, cfg: RLConfig):
+        self.x = np.asarray(x, dtype=float)
+        self.theta = float(theta)
+        self.cfg = cfg
+        self.t = None
+        self.pos = None  # -1, 0, +1
+        self.done = None
+
+        # Standardization for state features
+        std = float(np.std(self.x, ddof=1))
+        self.z = (self.x - self.theta) / (std + 1e-8)
+
+    def reset(self):
+        self.t = self.cfg.lookback_l
+        self.pos = 0
+        self.done = False
+        return self._state()
+
+    def _state_vector(self, t: int) -> np.ndarray:
+        l = self.cfg.lookback_l
+        if self.cfg.use_zscore_state:
+            # Use Δz bins in σ-units
+            window = self.z[t - l + 1 : t + 1]
+            prev   = self.z[t - l     : t]
+            dz = window - prev
+            k = float(self.cfg.k_std)
+            di = np.zeros(l, dtype=int)
+            di[dz >  k] =  2
+            di[(dz > 0) & (dz <= k)]  =  1
+            di[(dz < 0) & (dz >= -k)] = -1
+            di[dz < -k] = -2
+            return di
+        else:
+            # (legacy) % change binning (not recommended for spreads near 0)
+            k = self.cfg.k_thresh_pct
+            window = self.x[t - l + 1 : t + 1]
+            prev   = self.x[t - l     : t]
+            pct = (window - prev) / (np.where(prev != 0, prev, 1.0)) * 100.0
+            di = np.zeros(l, dtype=int)
+            di[pct >  k] =  2
+            di[(pct > 0) & (pct <= k)]  =  1
+            di[(pct < 0) & (pct >= -k)] = -1
+            di[pct < -k] = -2
+            return di
+
+    def _state_index(self, di: np.ndarray) -> int:
+        mapping = {-2:0, -1:1, 1:2, 2:3}
+        idx = 0
+        for v in di:
+            idx = idx * 4 + mapping[int(v)]
+        return idx
+
+    def _state(self) -> int:
+        return self._state_index(self._state_vector(self.t))
+
+    def allowed_actions(self) -> List[int]:
+        # one-step inventory changes only
+        if self.pos == 0:
+            return [-1, 0, +1]
+        elif self.pos == +1:
+            return [0, -1]      # can only reduce/close
+        else:  # pos == -1
+            return [0, +1]      # can only reduce/close
+
+    def step(self, action: int) -> Tuple[int, float, bool, Dict]:
+        if self.done:
+            raise RuntimeError("Episode already done")
+
+        if action not in self.allowed_actions():
+            action = 0
+
+        # Reward at t
+        R = float(action) * (self.theta - self.x[self.t]) - self.cfg.trans_cost * abs(int(action))
+
+        # Inventory transition
+        if action == +1 and self.pos < +1:
+            self.pos += 1
+        elif action == -1 and self.pos > -1:
+            self.pos -= 1
+
+        # Advance
+        self.t += 1
+        if self.t >= len(self.x) - 1:
+            self.done = True
+
+        s_next = self._state() if not self.done else None
+        return (s_next if s_next is not None else -1), R, self.done, {"pos": self.pos, "t": self.t}
