@@ -350,3 +350,52 @@ class MeanReversionEnv:
 
         s_next = self._state() if not self.done else None
         return (s_next if s_next is not None else -1), R, self.done, {"pos": self.pos, "t": self.t}
+
+class QLearningAgent:
+    def __init__(self, cfg: RLConfig):
+        self.cfg = cfg
+        self.num_states = 4 ** cfg.lookback_l
+        self.num_actions = 3  # [-1, 0, +1] (we'll mask illegal actions)
+        if cfg.seed is not None:
+            np.random.seed(cfg.seed)
+        self.Q = np.zeros((self.num_states, self.num_actions), dtype=float)
+
+    @staticmethod
+    def _action_to_index(a: int) -> int:
+        return { -1:0, 0:1, +1:2 }[a]
+
+    @staticmethod
+    def _index_to_action(i: int) -> int:
+        return { 0:-1, 1:0, 2:+1 }[i]
+
+    def policy_action(self, state: int, allowed: List[int], explore: bool) -> int:
+        if explore and np.random.rand() < self.cfg.epsilon:
+            return int(np.random.choice(allowed))
+
+        # Exploit: pick best allowed action
+        q_row = self.Q[state]
+        # Mask illegal actions by -inf
+        mask = np.full(self.num_actions, -np.inf)
+        for a in allowed:
+            mask[self._action_to_index(a)] = 0.0
+        q_masked = q_row + mask
+        a_idx = int(np.argmax(q_masked))
+        return self._index_to_action(a_idx)
+
+    def update(self, s: int, a: int, r: float, s_next: Optional[int], allowed_next: List[int]):
+        a_idx = self._action_to_index(a)
+        q_sa = self.Q[s, a_idx]
+
+        if s_next is None or len(allowed_next) == 0:
+            target = r
+        else:
+            # max over allowed actions
+            q_next = self.Q[s_next]
+            mask = np.full(self.num_actions, -np.inf)
+            for an in allowed_next:
+                mask[self._action_to_index(an)] = 0.0
+            best_next = np.max(q_next + mask)
+            target = r + self.cfg.gamma * best_next
+
+        self.Q[s, a_idx] = (1 - self.cfg.alpha) * q_sa + self.cfg.alpha * target
+
