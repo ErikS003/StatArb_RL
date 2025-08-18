@@ -399,3 +399,299 @@ class QLearningAgent:
 
         self.Q[s, a_idx] = (1 - self.cfg.alpha) * q_sa + self.cfg.alpha * target
 
+
+# -------------------------------
+# 3) OU Simulator and Training
+# -------------------------------
+
+def simulate_ou(
+    n_steps: int,
+    mu: float,
+    theta: float,
+    sigma: float,
+    x0: float = 0.0,
+    dt: float = 1.0/252.0,
+    rng: Optional[np.random.Generator] = None
+) -> np.ndarray:
+    """
+    Exact discretization of OU:
+    X_{t+1} = theta + (X_t - theta)*exp(-mu*dt) + sigma*sqrt((1 - exp(-2*mu*dt)) / (2*mu)) * eps_t
+
+    If mu==0, fallback to Brownian motion with drift towards theta (degenerate); we add small eps.
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+    xs = np.empty(n_steps, dtype=float)
+    xs[0] = x0
+    if mu <= 0:
+        mu = 1e-8
+    exp_term = math.exp(-mu * dt)
+    s2 = (1 - math.exp(-2 * mu * dt)) / (2 * mu)
+    vol = sigma * math.sqrt(max(s2, 0.0))
+
+    for t in range(n_steps - 1):
+        eps = rng.normal()
+        xs[t + 1] = theta + (xs[t] - theta) * exp_term + vol * eps
+    return xs
+
+
+def train_q_on_ou(
+    num_paths: int = 500,
+    n_steps: int = 252,
+    mu_range: Tuple[float, float] = (2.0, 10.0),
+    theta_range: Tuple[float, float] = (-1.0, 1.0),
+    sigma_range: Tuple[float, float] = (0.5, 1.5),
+    cfg: RLConfig = RLConfig(),
+) -> QLearningAgent:
+    """
+    Train the Q-learning agent on many OU paths, per Sec. 4.2 & 5.2.
+    Defaults are lighter than the paper (which used 10,000 paths) for speed.
+
+    Returns the trained agent.
+    """
+    agent = QLearningAgent(cfg)
+    rng = np.random.default_rng(cfg.seed)
+
+    for _ in range(num_paths):
+        mu = rng.uniform(*mu_range)
+        theta = rng.uniform(*theta_range)
+        sigma = rng.uniform(*sigma_range)
+        x = simulate_ou(n_steps=n_steps, mu=mu, theta=theta, sigma=sigma, x0=theta, rng=rng)
+        env = MeanReversionEnv(x, theta=theta, cfg=cfg)
+        s = env.reset()
+
+        # train for one episode (paper mentions ~10 episodes; we use 1 per path here)
+        while True:
+            allowed = env.allowed_actions()
+            a = agent.policy_action(s, allowed, explore=True)
+            s_next, r, done, info = env.step(a)
+            allowed_next = env.allowed_actions() if not done else []
+            agent.update(s, a, r, s_next if not done else None, allowed_next)
+            s = s_next
+            if done:
+                break
+    return agent
+
+
+# -------------------------------
+# 4) Backtesting on a spread with a trained agent
+# -------------------------------
+
+@dataclass
+class BacktestResult:
+    equity_curve: pd.Series
+    daily_returns: pd.Series
+    metrics: Dict[str, float]
+    trades: pd.DataFrame  # time, action, price, pos after, pnl_increment
+
+
+def backtest_policy_on_spread(
+    x: pd.Series,
+    agent: QLearningAgent,
+    cfg: RLConfig,
+    theta_estimate: Optional[float] = None,
+    close_at_end: bool = True
+) -> BacktestResult:
+    """
+    Backtest a trained policy on a real spread series.
+
+    Supports long, flat, and short inventory (pos ∈ {-1, 0, +1}) with one-unit sizing.
+    Cash accounting treats each unit change as an immediate trade at the current price,
+    with per-action transaction cost `cfg.trans_cost`.
+
+    Parameters
+    ----------
+    x : pd.Series
+        Spread series to trade (index ideally a DatetimeIndex).
+    agent : QLearningAgent
+        Trained Q-learning agent (uses greedy policy at inference).
+    cfg : RLConfig
+        RL configuration (lookback, costs, etc.).
+    theta_estimate : float, optional
+        Mean level used in the reward function during evaluation. If None, uses sample mean of x.
+    close_at_end : bool
+        If True, closes any open position at the last price.
+
+    Returns
+    -------
+    BacktestResult
+        equity_curve: pd.Series of mark-to-market equity
+        daily_returns: pd.Series of equity diffs (same frequency as x)
+        metrics: dict with TotalPnL, DailyMean/Std, DailySharpe, Sharpe(ann), MaxDrawdown
+        trades: pd.DataFrame with time, action (-1/0/+1), price, pos_after, reward
+    """
+    x = x.astype(float).copy()
+    assert len(x) > cfg.lookback_l + 2, "Spread series is too short for the chosen lookback."
+    theta = float(x.mean()) if theta_estimate is None else float(theta_estimate)
+
+    # Environment provides state transitions & reward; it also tracks its own internal pos.
+    env = MeanReversionEnv(x.values, theta=theta, cfg=cfg)
+    s = env.reset()
+
+    # Our cash/position ledger for PnL accounting (keep in sync with env via `action`)
+    cash = 0.0
+    pos = 0  # -1, 0, +1
+
+    equity = []
+    trades = []
+    idx = x.index
+
+    # Initialize equity at t = lookback
+    equity.append((idx[cfg.lookback_l], 0.0))
+
+    while True:
+        allowed = env.allowed_actions()
+        a = agent.policy_action(s, allowed, explore=False)  # greedy at inference
+
+        # Trade at the current price (before env.step advances time)
+        price = x.iloc[env.t]
+
+        # Cashflows for one-unit position changes
+        if a == +1:
+            if pos == 0:
+                # open long
+                cash -= price + cfg.trans_cost
+                pos = +1
+            elif pos == -1:
+                # close short (buy back)
+                cash -= price + cfg.trans_cost
+                pos = 0
+        elif a == -1:
+            if pos == 0:
+                # open short
+                cash += price - cfg.trans_cost
+                pos = -1
+            elif pos == +1:
+                # close long (sell)
+                cash += price - cfg.trans_cost
+                pos = 0
+
+        # Step the environment (updates internal pos & time; computes reward)
+        s_next, r, done, info = env.step(a)
+
+        # Mark-to-market equity AFTER the price updates to next step
+        mtm_equity = cash + pos * x.iloc[env.t]
+        equity.append((idx[env.t], mtm_equity))
+
+        trades.append({
+            "time": idx[env.t - 1],
+            "action": a,
+            "price": price,
+            "pos_after": pos,
+            "reward": r,
+        })
+
+        s = s_next
+        if done:
+            break
+
+    # Optionally close residual inventory at the very end
+    if close_at_end and pos != 0:
+        last_price = x.iloc[-1]
+        # Opposite action to flatten (no need to log reward here)
+        if pos == +1:
+            cash += last_price - cfg.trans_cost  # sell to close long
+        elif pos == -1:
+            cash -= last_price + cfg.trans_cost  # buy to close short
+        pos = 0
+        # Overwrite (or append) final equity at the last timestamp
+        equity.append((idx[-1], cash))
+        trades.append({
+            "time": idx[-1],
+            "action": -1 if pos == +1 else +1,  # action that would have been taken to close
+            "price": last_price,
+            "pos_after": pos,
+            "reward": float("nan"),
+        })
+
+    # Build series/dataframe outputs
+    equity_series = pd.Series([e for _, e in equity], index=[t for t, _ in equity]).astype(float)
+    rets = equity_series.diff().fillna(0.0)
+
+    # Basic performance stats (assumes business-day frequency if dates; otherwise "per step")
+    daily_std = float(rets.std())
+    daily_mean = float(rets.mean())
+    sharpe_daily = daily_mean / (daily_std + 1e-12)
+    sharpe_ann = sharpe_daily * math.sqrt(252.0)
+
+    # Max drawdown on equity
+    running_max = equity_series.cummax()
+    drawdown = equity_series - running_max
+    max_dd = float(drawdown.min())
+
+    metrics = {
+        "TotalPnL": float(equity_series.iloc[-1]),
+        "DailyMean": daily_mean,
+        "DailyStd": daily_std,
+        "DailySharpe": float(sharpe_daily),
+        "Sharpe(ann)": float(sharpe_ann),
+        "MaxDrawdown": max_dd,
+    }
+
+    trades_df = pd.DataFrame(trades)
+    return BacktestResult(equity_curve=equity_series, daily_returns=rets, metrics=metrics, trades=trades_df)
+
+
+# -------------------------------
+# 5) Utility: build spread from two price series (with B from EMRT on formation window)
+# -------------------------------
+
+def build_spread_with_emrt(
+    s1: pd.Series,
+    s2: pd.Series,
+    formation_slice: slice,
+    C: float = 2.0,
+    grid_step: float = 0.05
+) -> Tuple[pd.Series, float, float]:
+    """
+    Compute B on the formation window that minimizes EMRT, then return the full spread X = s1 - B*s2.
+
+    Returns (spread_series, B, emrt_on_formation)
+    """
+    s1, s2 = s1.align(s2, join="inner")
+    s1f = s1.loc[formation_slice]
+    s2f = s2.loc[formation_slice]
+    B, r = best_coefficient_emrt(s1f.values, s2f.values, C=C, grid_step=grid_step)
+    spread = s1 - B * s2
+    return spread, B, r
+
+
+# -------------------------------
+# 6) Tiny demo with synthetic data (runs fast)
+# -------------------------------
+
+def _demo():
+    rng = np.random.default_rng(42)
+    # Simulate two related price series by combining an OU spread with a random walk mean level
+    n = 600
+    spread = simulate_ou(n_steps=n, mu=6.0, theta=0.0, sigma=1.0, x0=0.0, rng=rng)
+    # Construct synthetic prices S1 = base + 0.5*spread; S2 = base - 0.5/B*spread so that X = S1 - B*S2 ≈ spread
+    base = np.cumsum(rng.normal(0, 0.5, size=n)) + 100.0
+    true_B = 1.3
+    s1 = base + 0.5 * spread
+    s2 = base - 0.5/true_B * spread
+
+    dates = pd.date_range("2022-01-01", periods=n, freq="B")
+    s1 = pd.Series(s1, index=dates, name="S1")
+    s2 = pd.Series(s2, index=dates, name="S2")
+
+    # Formation: first 300 obs; Trading: rest
+    formation_slice = slice(dates[0], dates[299])
+    trading_slice = slice(dates[300], dates[-1])
+
+    X, B_hat, r_hat = build_spread_with_emrt(s1, s2, formation_slice, C=2.0, grid_step=0.05)
+
+    # Train Q on a small batch of OU paths
+    cfg = RLConfig(lookback_l=4, k_thresh_pct=3.0, alpha=0.1, gamma=0.99, epsilon=0.1, trans_cost=0.0, seed=123)
+    agent = train_q_on_ou(num_paths=500, n_steps=252, cfg=cfg)
+
+    # Backtest on trading window
+    result = backtest_policy_on_spread(X.loc[trading_slice], agent, cfg, theta_estimate=X.loc[formation_slice].mean())
+
+    print("Estimated B via EMRT (formation):", B_hat, " (true ~", true_B, ")")
+    print("EMRT on formation:", r_hat)
+    print("Backtest metrics:", result.metrics)
+    return s1, s2, X, result
+
+if __name__ == "__main__":
+    _demo()
