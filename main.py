@@ -400,9 +400,7 @@ class QLearningAgent:
         self.Q[s, a_idx] = (1 - self.cfg.alpha) * q_sa + self.cfg.alpha * target
 
 
-# -------------------------------
 # 3) OU Simulator and Training
-# -------------------------------
 
 def simulate_ou(
     n_steps: int,
@@ -473,9 +471,7 @@ def train_q_on_ou(
     return agent
 
 
-# -------------------------------
 # 4) Backtesting on a spread with a trained agent
-# -------------------------------
 
 @dataclass
 class BacktestResult:
@@ -630,68 +626,3 @@ def backtest_policy_on_spread(
 
     trades_df = pd.DataFrame(trades)
     return BacktestResult(equity_curve=equity_series, daily_returns=rets, metrics=metrics, trades=trades_df)
-
-
-# -------------------------------
-# 5) Utility: build spread from two price series (with B from EMRT on formation window)
-# -------------------------------
-
-def build_spread_with_emrt(
-    s1: pd.Series,
-    s2: pd.Series,
-    formation_slice: slice,
-    C: float = 2.0,
-    grid_step: float = 0.05
-) -> Tuple[pd.Series, float, float]:
-    """
-    Compute B on the formation window that minimizes EMRT, then return the full spread X = s1 - B*s2.
-
-    Returns (spread_series, B, emrt_on_formation)
-    """
-    s1, s2 = s1.align(s2, join="inner")
-    s1f = s1.loc[formation_slice]
-    s2f = s2.loc[formation_slice]
-    B, r = best_coefficient_emrt(s1f.values, s2f.values, C=C, grid_step=grid_step)
-    spread = s1 - B * s2
-    return spread, B, r
-
-
-# -------------------------------
-# 6) Tiny demo with synthetic data (runs fast)
-# -------------------------------
-
-def _demo():
-    rng = np.random.default_rng(42)
-    # Simulate two related price series by combining an OU spread with a random walk mean level
-    n = 600
-    spread = simulate_ou(n_steps=n, mu=6.0, theta=0.0, sigma=1.0, x0=0.0, rng=rng)
-    # Construct synthetic prices S1 = base + 0.5*spread; S2 = base - 0.5/B*spread so that X = S1 - B*S2 ≈ spread
-    base = np.cumsum(rng.normal(0, 0.5, size=n)) + 100.0
-    true_B = 1.3
-    s1 = base + 0.5 * spread
-    s2 = base - 0.5/true_B * spread
-
-    dates = pd.date_range("2022-01-01", periods=n, freq="B")
-    s1 = pd.Series(s1, index=dates, name="S1")
-    s2 = pd.Series(s2, index=dates, name="S2")
-
-    # Formation: first 300 obs; Trading: rest
-    formation_slice = slice(dates[0], dates[299])
-    trading_slice = slice(dates[300], dates[-1])
-
-    X, B_hat, r_hat = build_spread_with_emrt(s1, s2, formation_slice, C=2.0, grid_step=0.05)
-
-    # Train Q on a small batch of OU paths
-    cfg = RLConfig(lookback_l=4, k_thresh_pct=3.0, alpha=0.1, gamma=0.99, epsilon=0.1, trans_cost=0.0, seed=123)
-    agent = train_q_on_ou(num_paths=500, n_steps=252, cfg=cfg)
-
-    # Backtest on trading window
-    result = backtest_policy_on_spread(X.loc[trading_slice], agent, cfg, theta_estimate=X.loc[formation_slice].mean())
-
-    print("Estimated B via EMRT (formation):", B_hat, " (true ~", true_B, ")")
-    print("EMRT on formation:", r_hat)
-    print("Backtest metrics:", result.metrics)
-    return s1, s2, X, result
-
-if __name__ == "__main__":
-    _demo()
